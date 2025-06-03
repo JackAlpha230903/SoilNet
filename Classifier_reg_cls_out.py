@@ -167,10 +167,14 @@ train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
 def extract_features(loader, model, device):
-    features_cls = []
-    features_reg = []
+    features_concat = []
+    features_img = []
+    features_light = []
+    features_hidden_cls = []
+    features_hidden_reg = []
     reg_targets = []
     cls_targets = []
+    
     model.eval()
     with torch.no_grad():
         for batch in tqdm(loader, unit="batch"):
@@ -178,34 +182,62 @@ def extract_features(loader, model, device):
             x_light = batch["light"].to(device)
             y_reg = batch["regression_target"]
             y_cls = batch["class_target"]
-            reg_out, cls_out, _ = model(x_img, x_light)
-            features_reg.extend(reg_out.cpu().numpy())
-            features_cls.extend(cls_out.cpu().numpy())
+
+            # Trích đặc trưng
+            x = model.initial_conv(x_img)
+            x = model.mnv2_block1(x)
+            x = model.channel_adapter(x)
+            x = model.mobilevit_encoder(x)
+            x = model.mvit_to_mnv2(x)
+            x = model.mnv2_block2(x)
+            x = model.final_conv(x)
+            x = model.pool(x)
+            x_img_feat = torch.flatten(x, 1)
+            x_light_feat = model.light_dense(x_light)
+            x_concat = torch.cat([x_img_feat, x_light_feat], dim=1)
+
+            # Trích đặc trưng ẩn từ các head
+            x_hidden_cls = F.relu(model.cls_head[0](x_concat))
+            x_hidden_reg = F.relu(model.reg_head[0](x_concat))
+
+            # Lưu lại
+            features_img.extend(x_img_feat.cpu().numpy())
+            features_light.extend(x_light_feat.cpu().numpy())
+            features_concat.extend(x_concat.cpu().numpy())
+            features_hidden_cls.extend(x_hidden_cls.cpu().numpy())
+            features_hidden_reg.extend(x_hidden_reg.cpu().numpy())
             reg_targets.extend(y_reg.numpy())
             cls_targets.extend(y_cls.numpy())
+
     return (
-        np.array(features_cls),
-        np.array(features_reg),
+        np.array(features_img),
+        np.array(features_light),
+        np.array(features_concat),
+        np.array(features_hidden_cls),
+        np.array(features_hidden_reg),
         np.array(reg_targets),
         np.array(cls_targets)
     )
 
-X_train_cls, X_train_reg, y_train_reg, y_train_cls = extract_features(train_loader, model, device)
-X_test_cls, X_test_reg, y_test_reg, y_test_cls = extract_features(test_loader, model, device)
+import torch.nn.functional as F
+X_img_train, X_light_train, X_concat_train, X_cls_head_train, X_reg_head_train, y_train_reg, y_train_cls = extract_features(train_loader, model, device)
+X_img_test, X_light_test, X_concat_test, X_cls_head_test, X_reg_head_test, y_test_reg, y_test_cls = extract_features(test_loader, model, device)
 
-scaler_cls = StandardScaler()
-X_train_cls_std = scaler_cls.fit_transform(X_train_cls)
-X_test_cls_std = scaler_cls.transform(X_test_cls)
-
-scaler_reg = StandardScaler()
-X_train_reg_std = scaler_reg.fit_transform(X_train_reg)
-X_test_reg_std = scaler_reg.transform(X_test_reg)
-
+from sklearn.preprocessing import StandardScaler
 y_train_reg = y_train_reg * 100
 y_test_reg = y_test_reg * 100
 
+scaler_cls = StandardScaler()
+X_train_cls_std = scaler_cls.fit_transform(X_cls_head_train)
+X_test_cls_std = scaler_cls.transform(X_cls_head_test)
+
+scaler_reg = StandardScaler()
+X_train_reg_std = scaler_reg.fit_transform(X_reg_head_train)
+X_test_reg_std = scaler_reg.transform(X_reg_head_test)
+
 target_scaler_sm0 = StandardScaler()
 target_scaler_sm20 = StandardScaler()
+
 y_train_reg_sm0_scaled = target_scaler_sm0.fit_transform(y_train_reg[:, 0].reshape(-1, 1))
 y_train_reg_sm20_scaled = target_scaler_sm20.fit_transform(y_train_reg[:, 1].reshape(-1, 1))
 
@@ -239,25 +271,34 @@ classifiers = {
 results = {}
 for name, (cls_model, reg_model) in tqdm(classifiers.items(), unit="model"):
     print(f"Training {name}...")
+
+
     cls_model.fit(X_train_cls_std, y_train_cls)
     y_pred_cls = cls_model.predict(X_test_cls_std)
     class_report = classification_report(y_test_cls, y_pred_cls, output_dict=True)
     weighted_avg = class_report["weighted avg"]
+
+
     y_pred_reg = np.zeros_like(y_test_reg)
+
     for i, label in enumerate(["SM_0", "SM_20"]):
-        if name == "SVM":
-            if label == "SM_0":
-                reg_model.fit(X_train_reg_std, y_train_reg_sm0_scaled.ravel())
-                y_pred_reg_scaled = reg_model.predict(X_test_reg_std).reshape(-1, 1)
-                y_pred_reg[:, i] = target_scaler_sm0.inverse_transform(y_pred_reg_scaled).ravel()
-            else:
-                reg_model.fit(X_train_reg_std, y_train_reg_sm20_scaled.ravel())
-                y_pred_reg_scaled = reg_model.predict(X_test_reg_std).reshape(-1, 1)
-                y_pred_reg[:, i] = target_scaler_sm20.inverse_transform(y_pred_reg_scaled).ravel()
+        # Chọn scaler và y_scaled đúng với label
+        if label == "SM_0":
+            y_train_scaled = y_train_reg_sm0_scaled.ravel()
+            scaler = target_scaler_sm0
         else:
-            reg_model.fit(X_train_reg_std, y_train_reg[:, i])
-            y_pred_reg[:, i] = reg_model.predict(X_test_reg_std)
+            y_train_scaled = y_train_reg_sm20_scaled.ravel()
+            scaler = target_scaler_sm20
+
+ 
+        reg_model.fit(X_train_reg_std, y_train_scaled)
+        y_pred_scaled = reg_model.predict(X_test_reg_std).reshape(-1, 1)
+
+
+        y_pred_reg[:, i] = scaler.inverse_transform(y_pred_scaled).ravel()
+
     y_pred_reg = np.clip(y_pred_reg, 0, 100)
+
     regression_metrics = {
         "SM_0": {
             "RMSE": np.sqrt(mean_squared_error(y_test_reg[:, 0], y_pred_reg[:, 0])),
@@ -270,6 +311,7 @@ for name, (cls_model, reg_model) in tqdm(classifiers.items(), unit="model"):
             "MSE": mean_squared_error(y_test_reg[:, 1], y_pred_reg[:, 1])
         }
     }
+
     results[name] = {
         "Classification": {
             "Accuracy": accuracy_score(y_test_cls, y_pred_cls),
@@ -280,15 +322,14 @@ for name, (cls_model, reg_model) in tqdm(classifiers.items(), unit="model"):
         "Regression": regression_metrics
     }
 
-print("So sánh hiệu suất (Using cls_head and reg_head features):")
 for name in results:
     print(f"{name}:")
     print("Classification:")
-    print(f"  Accuracy: {results[name]['Classification']['Accuracy']:.4f}")
-    print(f"  Precision: {results[name]['Classification']['Precision']:.4f}")
-    print(f"  Recall: {results[name]['Classification']['Recall']:.4f}")
-    print(f"  F1-Score: {results[name]['Classification']['F1-Score']:.4f}")
+    print(f"  Accuracy: {results[name]['Classification']['Accuracy']:.8f}")
+    print(f"  Precision: {results[name]['Classification']['Precision']:.8f}")
+    print(f"  Recall: {results[name]['Classification']['Recall']:.8f}")
+    print(f"  F1-Score: {results[name]['Classification']['F1-Score']:.8f}")
     print("Regression:")
     for label in ["SM_0", "SM_20"]:
         reg = results[name]["Regression"][label]
-        print(f"  {label}: RMSE: {reg['RMSE']:.4f}, MAE: {reg['MAE']:.4f}")
+        print(f"  {label}: RMSE: {reg['RMSE']:.4f}, MAE: {reg['MAE']:.8f}")
